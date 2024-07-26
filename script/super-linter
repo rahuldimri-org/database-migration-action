@@ -1,0 +1,14 @@
+#!/bin/bash
+
+docker \
+  run \
+  --name super-linter \
+  -e RUN_LOCAL=true \
+  -e USE_FIND_ALGORITHM=true \
+  -e IGNORE_GITIGNORED_FILES=true \
+  -e TYPESCRIPT_DEFAULT_STYLE=prettier \
+  -e VALIDATE_JSCPD=false \
+  -v "${PWD}":/tmp/lint \
+  github/super-linter:latest
+  
+  #-e EXPERIMENTAL_BATCH_WORKER=true \

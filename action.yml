@@ -1,0 +1,156 @@
+# Generate github metadata file action.yml for generating db migrations
+name: 'DB Migrations'
+description: 'Run DB migrations'
+branding:
+  icon: 'database'
+  color: 'purple'
+inputs:
+  repo_token:
+    description: 'GitHub token'
+    required: true
+  jira_username:
+    description: JIRA username
+  jira_password:
+    description: JIRA password
+  jira_config:
+    description:
+      'JIRA config token having following keys host, project, issueType("Story"), fields.pr, fields.prLabel,
+      fields?.repo, fields.driApprovals, approvalStatus("DONE"), doneValue("Done")'
+    required: true
+  aws_secret_store:
+    description: AWS Secret ID where database connection strings are stored
+  migration_config_file:
+    description: 'Migration configuration file'
+    default: './db.migration.json'
+  dev_db_url:
+    description: 'Used to run lint operation against this DB'
+  atlas_version:
+    description: Atlas version
+    default: v0.18.0
+  debug:
+    description: 'show debug logs (true|false)'
+    default: 'false'
+  db_migration_echo_url:
+    description: 'Echo github context and payload to URL'
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # - name: Print GitHub Context
+    #   shell: bash
+    #   run: echo "${{ toJson(github) }}"
+    - name: setup event outputs
+      id: checks
+      shell: bash
+      run: |
+        pr_comment=${{
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request &&
+          startsWith(github.event.comment.body, 'db migrate') && '1' || '0'
+        }}
+        pr_review=${{
+          github.event_name == 'pull_request_review' &&
+          github.event.review.state == 'approved' &&
+          !github.event.pull_request.draft && '1' || '0'
+        }}
+        pr=${{
+          github.event_name == 'pull_request' &&
+          !github.event.pull_request.draft && '1' || '0'
+        }}
+        schedule=${{
+          github.event_name == 'schedule' && '1' || '0'
+        }}
+
+        if [[ $schedule == '1' || $pr_comment == '1' || $pr_review == '1' || $pr == '1' ]]; then
+          can_execute='1'
+        else
+          can_execute='0'
+        fi
+
+        echo "can_execute=$can_execute"
+
+        echo "pr_comment=$pr_comment" >> $GITHUB_OUTPUT
+        echo "pr_review=$pr_review" >> $GITHUB_OUTPUT
+        echo "pr=$pr" >> $GITHUB_OUTPUT
+        echo "schedule=$schedule" >> $GITHUB_OUTPUT
+        echo "can_execute=$can_execute" >> $GITHUB_OUTPUT
+
+    - name: Fetch PR details for PR Comment
+      id: pr_details
+      shell: bash
+      if: ${{ steps.checks.outputs.pr_comment == '1' }}
+      env:
+        REPO_TOKEN: ${{ inputs.repo_token }}
+      run: |
+        PR_DETAILS=$(curl -s -L -H "Authorization: token $REPO_TOKEN" "${{ github.event.issue.pull_request.url }}" | jq -c .)
+        head_sha=$(echo $PR_DETAILS | jq -rc .head.sha)
+        labels=$(echo $PR_DETAILS | jq -rc .head.sha)
+        echo "PR_DETAILS=$PR_DETAILS" >> $GITHUB_ENV
+        echo "pr=$PR_DETAILS" >> $GITHUB_OUTPUT
+        echo "head_sha=$head_sha" >> $GITHUB_OUTPUT
+        echo "labels=$labels" >> $GITHUB_OUTPUT
+
+    - name: checkout repo for PR Comments
+      uses: actions/checkout@v4
+      if: ${{ steps.checks.outputs.can_execute == '1' }}
+      with:
+        persist-credentials: false
+        # If empty, defaults to process.env.GITHUB_SHA
+        ref: ${{ steps.pr_details.outputs.head_sha }}
+        # Checkout repo as we will do git diff for finding files
+        fetch-depth: 0
+
+    - name: get changed files
+      id: changed-files
+      if: ${{ steps.checks.outputs.pr == '1' }}
+      uses: tj-actions/changed-files@v40
+      with:
+        json: true
+
+    # - name: set changed files
+    #   if: ${{ steps.checks.outputs.pr == '1' }}
+    #   shell: bash
+    #   run: |
+    #     echo "Called Set Changed Files in Env Var"
+    #     echo "PR_CHANGED_FILES=${{ steps.changed-files.outputs.all_changed_files }}"
+
+    # - name: checkout repo for PR Events
+    #   if: (steps.checks.outputs.can_execute == '1' && steps.checks.outputs.pr_comment != '1')
+    #   uses: actions/checkout@v3
+
+    - name: Cache atlas
+      id: cache-atlas
+      uses: actions/cache@v3
+      if: steps.checks.outputs.can_execute == '1'
+      with:
+        path: /usr/local/bin/atlas
+        key: atlas-${{ inputs.atlas_version }}-${{ runner.os }}
+
+    - name: setup atlas
+      shell: bash
+      if: (steps.checks.outputs.can_execute == '1' && steps.cache-atlas.outputs.cache-hit != 'true')
+      run: curl -sSf https://atlasgo.sh | ATLAS_VERSION=${{inputs.atlas_version}} CI=true sh -s -- --community
+
+    - name: setup_node
+      uses: actions/setup-node@v4
+      if: steps.checks.outputs.can_execute == '1'
+      with:
+        node-version: 20
+
+    - name: migration approvals
+      if: steps.checks.outputs.can_execute == '1'
+      shell: bash
+      run: node $GITHUB_ACTION_PATH/dist/index.js
+      env:
+        INPUT_REPO_TOKEN: ${{ inputs.repo_token }}
+        INPUT_JIRA_USERNAME: ${{ inputs.jira_username }}
+        INPUT_JIRA_PASSWORD: ${{ inputs.jira_password }}
+        INPUT_JIRA_CONFIG: ${{ inputs.jira_config }}
+        INPUT_AWS_SECRET_STORE: ${{ inputs.aws_secret_store }}
+        INPUT_MIGRATION_CONFIG_FILE: ${{ inputs.migration_config_file }}
+        INPUT_DEV_DB_URL: ${{ inputs.dev_db_url }}
+        INPUT_DEBUG: ${{ inputs.debug }}
+        INPUT_DB_MIGRATION_ECHO_URL: ${{ inputs.db_migration_echo_url}}
+        PR_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files || '' }}
+        PR_DETAILS: ${{ steps.checks.outputs.pr || '' }}
